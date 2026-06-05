@@ -1,0 +1,232 @@
+---------------------------CC------------------------------
+------CREDIT CARD - MAY 2026 MONTHLY METRICS-----------
+-- Verified against Snowflake 2026-06-05
+-- All amounts in dollars (cents divided by 100)
+-- Test group excluded: business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+
+
+-- ============================================================
+-- 1. # of accounts with a bankruptcy filed in May 2026
+-- ============================================================
+-- Result: 0 accounts in May 2026 (1 all-time, not in May)
+-- Source: CREDIT_CARD_CLOSE_ACCOUNT_REQUESTS.reason = 'Bankruptcy'
+-- Cross-checked: CREDIT_CARD_ACCOUNT_TAG_MAPPINGS.bankruptcy_condition_id also 0 for May 2026
+select
+ count(distinct business_id) as bankruptcy_acct_count
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_CLOSE_ACCOUNT_REQUESTS
+where reason = 'Bankruptcy'
+and to_char(created_at, 'YYYY-MM') = '2026-05'
+and business_id not in (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+;
+-- May 2026 result: 0
+
+
+-- ============================================================
+-- 2. % Net Charge-Off Rate in May 2026
+-- ============================================================
+-- Monthly NCO Rate = Gross Charge-Off Principal / Avg Outstanding Balance
+-- Annualized = monthly rate * 12
+-- Charge-off recognized at days_past_due 180-210 at month-end statement
+-- Result: gross_chargeoff=$26,523, 21 accts, monthly NCO=0.33%, annualized=3.93%
+with loan_tape_updated as (
+select
+ a.*
+,b.business_id
+,row_number() over (partition by b.business_id, a.statement_date order by a.record_version desc) as rn
+from PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY a
+left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS b
+on a.account_id = b.external_account_id
+where b.business_id not in (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+and a.billing_period_number >= 1
+),
+monthly_balance_raw as (
+select
+ to_char(statement_date, 'YYYY-MM') as report_mth
+,round(sum(case when days_past_due <= 210 then ending_balance end) / 100, 2) as ending_balance
+from (select * from loan_tape_updated where rn = 1)
+where statement_date in (select last_day(statement_date) from loan_tape_updated where rn = 1)
+group by 1
+),
+monthly_balance as (
+select
+ report_mth
+,ending_balance
+,lag(ending_balance) over (order by report_mth) as beginning_balance
+from monthly_balance_raw
+),
+chargeoff as (
+select
+ to_char(statement_date, 'YYYY-MM') as report_mth
+,round(sum(case when days_past_due between 180 and 210
+    then (next_due_principal + past_statements_principal + due_principal + past_due_principal) / 100
+    end), 2) as gross_chargeoff
+,count(distinct case when days_past_due between 180 and 210 then business_id end) as co_acct_count
+from (select * from loan_tape_updated where rn = 1)
+where statement_date in (select last_day(statement_date) from loan_tape_updated where rn = 1)
+group by 1
+)
+select
+ a.report_mth
+,a.gross_chargeoff
+,a.co_acct_count
+,b.beginning_balance
+,b.ending_balance
+,round((b.beginning_balance + b.ending_balance) / 2, 2) as avg_outstanding_balance
+,round(a.gross_chargeoff / nullifzero((b.beginning_balance + b.ending_balance) / 2), 4) as monthly_nco_rate
+,round(a.gross_chargeoff / nullifzero((b.beginning_balance + b.ending_balance) / 2) * 12, 4) as annualized_nco_rate
+from chargeoff a
+left join monthly_balance b
+on a.report_mth = b.report_mth
+where a.report_mth = '2026-05'
+;
+-- May 2026 result: gross_chargeoff=$26,523.08, 21 accounts, avg_balance=$8,096,207, monthly=0.33%, annualized=3.93%
+
+
+-- ============================================================
+-- 3. % Repayment Rate (% of customers paying balance in full) in May 2026
+-- ============================================================
+-- Denominator: accounts with a non-zero statement balance due in May 2026
+-- Numerator: accounts where total payments >= statement balance before due date
+-- Result: 4,564 accounts with balance due, 1,635 paid in full, 35.82% repayment rate
+with statements as (
+select
+ cs.business_id
+,cs.statement_balance / 100 as statement_balance
+,cs.end_date
+,cs.payment_due_date
+,coalesce(sum(cp.amount / 100), 0) as total_payments_made
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_STATEMENTS cs
+left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_PAYMENTS cp
+on cs.business_id = cp.business_id
+and cp.created_at::date > cs.end_date::date
+and cp.created_at::date <= cs.payment_due_date::date
+and cp.amount > 0
+where cs.business_id not in (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+and to_char(cs.payment_due_date, 'YYYY-MM') = '2026-05'
+and cs.statement_balance > 0
+group by 1, 2, 3, 4
+)
+select
+ count(distinct business_id) as accts_with_balance_due
+,count(distinct case when total_payments_made >= statement_balance then business_id end) as paid_in_full_count
+,round(
+    count(distinct case when total_payments_made >= statement_balance then business_id end)
+    / nullifzero(count(distinct business_id)),
+    4
+) as repayment_rate
+from statements
+;
+-- May 2026 result: 4,564 accounts with balance, 1,635 paid in full, repayment_rate=35.82%
+
+
+-- ============================================================
+-- 4. % of total chargeback transactions of all card transactions in May 2026
+-- 5. $ Total chargeback amount of all card transactions in May 2026
+-- ============================================================
+-- Chargebacks = entries in CREDIT_CARD_TRANSACTION_DISPUTES (all type='customer')
+-- Denominator = settled transactions (result='APPROVED', status='settled')
+-- Note: two approaches below:
+--   A) Disputes table: captures # of dispute records filed in May 2026 (89 disputes, $15,951 disputed)
+--   B) Settlement report: captures $ that cleared the network as chargebacks in May 2026 ($8,282 settled)
+--   Use A for count/rate; use B for dollar amount that actually settled
+
+-- 4A + 5A: via CREDIT_CARD_TRANSACTION_DISPUTES (dispute count and filed amounts)
+-- Result: 50,729 settled txns, 89 disputes filed, $15,950.80 disputed, 0.1754% chargeback rate
+with disputes as (
+select
+ count(*) as dispute_count
+,round(sum(amount) / 100, 2) as total_disputed_amount
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_TRANSACTION_DISPUTES
+where to_char(created_at, 'YYYY-MM') = '2026-05'
+and business_id not in (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+),
+all_txns as (
+select
+ count(*) as total_txn_count
+,round(sum(settled_amount) / 100, 2) as total_settled_amount
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_TRANSACTIONS
+where to_char(created_at, 'YYYY-MM') = '2026-05'
+and business_id not in (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+and result = 'APPROVED'
+and status = 'settled'
+)
+select
+ a.total_txn_count
+,a.total_settled_amount
+,b.dispute_count
+,b.total_disputed_amount
+,round(b.dispute_count / nullifzero(a.total_txn_count), 6) as chargeback_pct_of_txns
+from all_txns a
+cross join disputes b
+;
+-- May 2026 result: 50,729 settled txns, $4,502,827 volume, 89 disputes, $15,950.80 disputed, 0.1754%
+
+-- 5B: via CREDIT_CARD_NOVO_SETTLEMENT_REPORT_ITEMS (amount that cleared settlement network)
+-- Result: 27 accounts with settled chargebacks, $8,282.17 cleared through network
+select
+ count(case when sri.disputes_gross_amount != 0 then 1 end) as accounts_with_settled_chargebacks
+,round(sum(abs(sri.disputes_gross_amount)) / 100, 2) as total_settled_chargeback_amount
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_NOVO_SETTLEMENT_REPORT_ITEMS sri
+left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS ca
+on sri.credit_card_account_id = ca.id
+where to_char(sri.report_date, 'YYYY-MM') = '2026-05'
+and ca.business_id not in (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+;
+-- May 2026 result: 27 accounts, $8,282.17 settled chargeback amount
+
+
+-- ============================================================
+-- 6. # Total monthly active credit cards on file at end of May 2026
+-- ============================================================
+-- Active = accounts not yet charged off (days_past_due < 180) at month-end statement
+-- Result: 7,402 total active, 6,978 current, 424 delinquent-but-not-charged-off
+with loan_tape_updated as (
+select
+ a.*
+,b.business_id
+,row_number() over (partition by b.business_id, a.statement_date order by a.record_version desc) as rn
+from PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY a
+left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS b
+on a.account_id = b.external_account_id
+where b.business_id not in (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+and a.billing_period_number >= 1
+)
+select
+ to_char(statement_date, 'YYYY-MM') as report_mth
+,count(distinct case when days_past_due < 180 then business_id end) as total_active_cards
+,count(distinct case when days_past_due = 0 then business_id end) as current_cards
+,count(distinct case when days_past_due between 1 and 179 then business_id end) as delinquent_not_co_cards
+from (select * from loan_tape_updated where rn = 1)
+where statement_date in (select last_day(statement_date) from loan_tape_updated where rn = 1)
+and to_char(statement_date, 'YYYY-MM') = '2026-05'
+group by 1
+;
+-- May 2026 result: 7,402 total active cards (6,978 current + 424 delinquent-not-CO)
