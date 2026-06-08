@@ -59,17 +59,342 @@ All queries in this directory hit Snowflake production:
 |---|---|---|
 | `PROD_DB` | `DATA` | Core loan tape, account history |
 | `FIVETRAN_DB` | `PROD_NOVO_API_PUBLIC` | API replica — accounts, applications, transactions |
+| `PROD_DB` | `ADHOC` | Monitoring views and lookup tables (BI_ROLE may lack access to some) |
 
-Excluded business group (internal/test accounts): `75fe98d2-6549-46a1-aa04-a1c621e21d9e`
+**F&F exclusion — apply to every query:**
+```sql
+business_id not in (
+    select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+```
+
+## Data model
+
+```
+CREDIT_CARD_APPLICATIONS
+    → CREDIT_CARD_APPLICATION_DECISIONS  (join on application_id)
+    → CREDIT_CARD_ACCOUNTS               (shared business_id;
+                                          accounts.external_account_id = loan_tape.account_id)
+        → CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY      (account_id)
+        → CREDIT_CARD_STATEMENTS                     (credit_card_account_id / business_id)
+        → CREDIT_CARD_PAYMENTS                       (credit_card_account_id / business_id)
+        → CREDIT_CARD_TRANSACTIONS                   (business_id)
+        → CREDIT_CARD_AUTOPAY_INSTRUCTIONS           (credit_card_account_id / business_id)
+        → CREDIT_CARD_NOVO_SETTLEMENT_REPORT_ITEMS   (credit_card_account_id = accounts.id)
+        → CREDIT_CARD_TRANSACTION_REWARD_ITEMS       (credit_card_account_id = accounts.id)
+        → CREDIT_CARD_TRANSACTION_DISPUTES           (business_id)
+
+CREDIT_CARD_INVITATIONS  (business_id) — FICO score source (pre-approval, not refreshed)
+BUSINESS_GROUP_ASSIGNMENTS (business_id) — F&F / internal test account exclusion list
+PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campaign tagging
+```
+
+## Table reference
+
+### `PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY` — the core risk table
+
+- **Grain:** `(account_id, statement_date, record_version)`. Always dedupe:
+  ```sql
+  row_number() over (partition by business_id, statement_date order by record_version desc) = 1
+  ```
+- ~8,210 distinct accounts; data from Oct 2024 → present
+- **All money columns are in cents — divide by 100 everywhere**
+- `billing_period_number = 0` is the booking-month statement (often excluded with `>= 1`)
+- Filter to month-end snapshots: `statement_date in (select last_day(statement_date) from ...)`
+
+| Column | Notes |
+|---|---|
+| `days_past_due` | 0=current, 1–29/30–59/60–89/90–179=DQ buckets, 180–210=chargeoff transition, >210=post-CO |
+| `billing_period_number` | Statement cycle counter. 0 = booking month |
+| `ending_balance` | Total balance at statement close (cents) |
+| `credit_limit` | Approved limit (cents) |
+| `next_due_principal + past_statements_principal + due_principal + past_due_principal` | **4-slice principal sum** — total principal owed; used for chargeoff $ |
+| `payment_allocated_principal / interest / fees` | Payments received that period by component (cents) |
+| `effective_apr_purchases` | Purchase APR in effect |
+| `grace_period` | Boolean — TRUE means paid in full last cycle, no interest accruing |
+| `record_version` | Higher = more recent; used in dedup ROW_NUMBER |
+| `starting_balance` / `ending_balance` | Period open/close balances |
+| `daily_balance_purchases` | ADB for purchase balance |
+
+### `CREDIT_CARD_ACCOUNTS`
+
+- `external_account_id` = join key to loan tape `account_id`
+- `id` = join key for settlement report and reward items
+- `_fivetran_deleted` is NULL (not false) for live records — omit the filter or use `coalesce(_fivetran_deleted, false) = false`
+- `status` / `external_status` — account lifecycle; `is_account_in_collection` boolean
+
+### `CREDIT_CARD_APPLICATIONS` + `CREDIT_CARD_APPLICATION_DECISIONS`
+
+- 8,217 approved, 347 denied; Oct 2024 → present
+- Join: `decisions.application_id = applications.id`
+- `decisions.created_at` = approval timestamp — used as booking date in vintage analysis
+- `approved_credit_limit`, `approved_apr`, `rejected_reasons` (VARIANT array) live on decisions
+
+### `CREDIT_CARD_STATEMENTS`
+
+- `start_date` / `end_date` = billing window; `payment_due_date` = payment deadline
+- `statement_balance`, `minimum_payment_due` in cents
+- `earned_cashback`, `redeemed_cashback` in cents
+
+### `CREDIT_CARD_PAYMENTS`
+
+- Statuses: `settled` (90K), `failed` (11K), `returned` (197), `cancelled`, `pending`
+- Only use `status = 'settled'` for collection/revenue analysis
+- `autopay_instruction_id` — non-null = autopay-triggered payment
+- `option` — payment option chosen (minimum, full, custom)
+
+### `CREDIT_CARD_TRANSACTIONS`
+
+- 516K settled/approved; 79K declined
+- Use `status = 'settled' AND result = 'APPROVED'` for purchase volume
+- `settled_amount` in cents; `merchant_category_code` for spend categorisation
+
+### `CREDIT_CARD_AUTOPAY_INSTRUCTIONS`
+
+| Type | Active | Inactive |
+|---|---|---|
+| `statement_balance` | 1,181 | 528 |
+| `minimum_due` | 1,070 | 575 |
+| `fixed_amount` | 142 | 241 |
+
+- No business ever has >1 active instruction simultaneously (verified)
+- Launched Oct 2024; full history available
+- **Point-in-time enrollment** for month M:
+  ```sql
+  created_at::date <= last_day(M)
+  and (status = 'active' or updated_at::date > last_day(M))
+  ```
+  `updated_at` = effective cancellation date for inactive instructions
+
+### `CREDIT_CARD_NOVO_SETTLEMENT_REPORT_ITEMS`
+
+- One row per account per settlement report (daily cadence)
+- `interchange_gross_amount` — **negative cents** (revenue to Novo). Use `* -1 / 100`
+- Join: `credit_card_account_id = CREDIT_CARD_ACCOUNTS.id`
+
+### `CREDIT_CARD_TRANSACTION_REWARD_ITEMS`
+
+- `rewards` — cashback accrued per transaction, **negative cents**. Use `* -1 / 100`
+- Join: `credit_card_account_id = CREDIT_CARD_ACCOUNTS.id`
+
+### `CREDIT_CARD_TRANSACTION_DISPUTES`
+
+- 1,175 accepted, 437 rejected; all `type = 'customer'`
+- `amount` in cents; use `status = 'accepted'` for purchase fraud cost
+- `approved_dispute_amount` = final accepted amount
+
+### `CREDIT_CARD_INVITATIONS`
+
+- FICO score range: 581–850; avg ~769
+- Pre-approval score only — not refreshed post-booking
+- Always take the most recent: `row_number() over (partition by business_id order by created_at desc) = 1`
+
+### `PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP`
+
+- Maps `business_id` → `risk_bucket` and `campaign` for vintage segmentation
+- Used in the monitoring dashboard vintage driver (`30_vintage_driver.sql`)
+- Note: BI_ROLE may not have access from all connection contexts
+
+## Universal business logic
+
+### DPD bucket convention
+
+| Range | Label |
+|---|---|
+| 0 | Current |
+| 1–29 | Bucket 1 |
+| 30–59 | Bucket 2 |
+| 60–179 | Bucket 3+ / pre-CO delinquent |
+| 180–210 | Chargeoff transition |
+| >210 | Post-CO / out of scope |
+
+### Chargeoff recognition
+
+- Triggered when `days_past_due BETWEEN 180 AND 210` at month-end statement
+- Dollar amount = 4-slice principal sum: `(next_due_principal + past_statements_principal + due_principal + past_due_principal) / 100`
+- Take first crossing only to avoid double-counting:
+  ```sql
+  qualify row_number() over (partition by account_id order by statement_date asc) = 1
+  ```
+
+### Cohort-matched NACO
+
+- Gross CO = principal at first DPD 180–210 crossing
+- Recovery = `payment_allocated_principal` in months strictly after `co_month` for those same accounts
+- Net CO = gross CO − cumulative recovery
+- Rate denominator = `(prior_month_ending_balance + current_ending_balance) / 2`
+- Annualise by multiplying monthly rate × 12
+
+### Amount handling
+
+- **Every monetary field across all tables is stored in cents**
+- Divide by 100 for dollars
+- Interchange and rewards are stored as negative — multiply by −1 before dividing
+
+### Cure rate
+
+- Delinquent = `days_past_due BETWEEN 1 AND 179` at month-end
+- Cured = same account at `days_past_due = 0` the following month-end
+- Rolled to CO = `days_past_due >= 180` the following month — not a cure
+
+## DDA (checking account) tables
+
+These two tables cover the Novo DDA (demand deposit / checking) product. Nearly all CC customers (~8,186 of ~8,210) also have a DDA account. Both join to the CC world via `business_id`.
+
+### `PROD_DB.DATA.BALANCES_DAILY`
+
+- **Grain:** one row per `(business_id, date)` — verified no duplicates
+- 400M+ rows; data from Aug 2018 → present
+- Three columns only:
+
+| Column | Notes |
+|---|---|
+| `business_id` | Join key to all CC tables |
+| `date` | Calendar date of the balance snapshot |
+| `day_end_balance` | End-of-day DDA balance in **dollars** (not cents — unlike CC tables) |
+
+Typical usage:
+```sql
+-- Daily balance for CC customers
+select b.date, b.day_end_balance
+from PROD_DB.DATA.BALANCES_DAILY b
+join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS cc
+    on cc.business_id = b.business_id
+where b.date = '2026-05-31'
+```
+
+### `PROD_DB.DATA.TRANSACTIONS`
+
+- **Grain:** one row per transaction (`transaction_id`)
+- 97M+ rows; data from Dec 2017 → present
+- Amounts in **dollars** (not cents). Positive = inflow, negative = outflow
+- Use `status = 'active'` for settled transactions (rejects are ~1M rows)
+
+**Key columns:**
+
+| Column | Notes |
+|---|---|
+| `transaction_id` | Primary key |
+| `business_id` | Join key to CC tables |
+| `account_id` | DDA account identifier |
+| `amount` | Dollars. Positive = inflow (credit), negative = outflow (debit) |
+| `type` | `credit` (inflows, 29M rows) or `debit` (outflows, 68M rows) |
+| `status` | `active` (95M), `rejected` (1M), `pending` (290K). Use `active` for analysis |
+| `medium` | Transaction channel — see breakdown below |
+| `created_date` | Date transaction was created |
+| `posted_date` | Date transaction posted |
+| `effective_date` | Value date |
+| `running_balance` | Account balance after this transaction |
+| `category` / `supercategory` | Spend categorisation |
+| `merchant_category_code` | MCC for card transactions |
+| `card_revenue` | Interchange revenue on debit card transactions |
+| `short_description` | Cleaned merchant/payee name |
+
+**`medium` breakdown (top values):**
+
+| Medium | Count | Direction |
+|---|---|---|
+| POS Withdrawal | 44.7M | outflow — debit card purchases |
+| External Deposit | 20.8M | inflow — ACH / external transfers in |
+| External Withdrawal | 15.2M | outflow — ACH / external transfers out |
+| Withdrawal | 6.1M | outflow — various |
+| EFT Credit | 3.1M | inflow |
+| Deposit | 3.0M | inflow — direct deposits |
+| ATM Withdrawal | 1.1M | outflow |
+| Check | 458K | mixed |
+| Domestic Wire Deposit | 167K | inflow |
+
+**Joining to credit businesses:**
+```sql
+-- DDA transaction activity for CC cardholders
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS cc
+join PROD_DB.DATA.TRANSACTIONS t
+    on t.business_id = cc.business_id
+   and t.status = 'active'
+where cc.business_id not in (
+    select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+)
+```
+
+**Important:** DDA amounts are in **dollars** — no /100 needed, unlike all CC loan tape fields.
+
+**Gotcha:** `PROD_DB.DATA.TRANSACTIONS` does NOT have a `created_at` column. Use `created_date` (DATE) for monthly bucketing: `to_char(t.created_date, 'YYYY-MM')`. Also available: `posted_date`, `effective_date`, `transaction_date` (TIMESTAMP_TZ).
+
+### Joining DDA + CC for a single account
+
+```sql
+with acct as (
+    select '<business_id>' as business_id
+)
+-- DDA balance
+select to_char(b.date, 'YYYY-MM') as report_mth, avg(b.day_end_balance) as avg_daily_balance
+from acct a
+join PROD_DB.DATA.BALANCES_DAILY b on b.business_id = a.business_id
+group by 1
+
+-- DDA transactions
+select to_char(t.created_date, 'YYYY-MM') as report_mth,
+       sum(case when t.amount > 0 then t.amount else 0 end) as inflow,
+       sum(case when t.amount < 0 then -t.amount else 0 end) as outflow
+from acct a
+join PROD_DB.DATA.TRANSACTIONS t on t.business_id = a.business_id
+where t.status = 'active'
+group by 1
+```
+
+### Finding individual accounts for investigation
+
+Use this pattern to pull a shortlist of accounts matching FICO band, booking window, and activity criteria:
+
+```sql
+with inv as (
+    select business_id, fico_score
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_INVITATIONS
+    qualify row_number() over (partition by business_id order by created_at desc) = 1
+),
+booking as (
+    select b.business_id, min(d.created_at)::date as booking_date
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS d
+        on d.application_id = a.id and d.decision = 'APPROVED'
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS b on b.business_id = a.business_id
+    group by 1
+),
+stmt_count as (
+    select b.business_id,
+           count(distinct a.statement_date) as stmt_count,
+           max(a.days_past_due)             as max_dpd
+    from PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY a
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS b on a.account_id = b.external_account_id
+    where a.billing_period_number >= 1
+    group by 1
+)
+select bk.business_id, bk.booking_date, inv.fico_score, sc.stmt_count, sc.max_dpd
+from booking bk
+join inv        on inv.business_id = bk.business_id
+join stmt_count sc on sc.business_id = bk.business_id
+-- optionally join active_may to filter to still-active accounts
+where inv.fico_score between 660 and 719          -- ← adjust FICO band
+  and bk.booking_date between '2024-10-01' and '2025-12-31'
+  and bk.business_id not in (
+      select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+      where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+  )
+order by sc.max_dpd desc, sc.stmt_count desc
+```
 
 ## SQL files in this directory
 
 | File | Purpose |
 |---|---|
-| `outstanding_balance_vs_ar_comparison.sql` | Compares Q1 outstanding balance vs Q2 AR across DPD 0–180; surfaces differences |
-| `cc_recovery_validation.sql` | Per-account loan tape walkthrough for charge-off/recovery validation |
-| `cc_chargeoff_rate_by_month.sql` | Monthly charge-off rate trends |
+| `cc_chargeoff_rate_by_month.sql` | Cohort-matched NACO: gross CO, recoveries, net CO rate by chargeoff month |
+| `cc_recovery_validation.sql` | Step-by-step account-level validation of chargeoff + recovery flow |
+| `may_2026_cc_metrics.sql` | Monthly CC metrics: NCO rate, repayment rate, autopay enrollment, cure rate, active card counts, application IDs |
+| `nearprime_account_investigation.sql` | FICO 660-719 cohort: DDA behavior + CC performance by month; individual account drilldown (Q3/Q4) |
+| `Compliance.sql` | Application IDs Apr–May 27 2026 |
 | `cc_vintage_snapshot.sql` | Vintage-level snapshot of credit card cohorts |
-| `may_2026_cc_metrics.sql` | May 2026 credit card metric pull |
+| `outstanding_balance_vs_ar_comparison.sql` | Compares outstanding balance vs AR across DPD buckets |
 | `monitoring.sql` | Ad-hoc monitoring queries |
 | `explore.sql` | Exploratory / scratch queries |

@@ -230,3 +230,121 @@ and to_char(statement_date, 'YYYY-MM') = '2026-05'
 group by 1
 ;
 -- May 2026 result: 7,402 total active cards (6,978 current + 424 delinquent-not-CO)
+
+
+-- ============================================================
+-- Autopay Enrollment by Month (point-in-time, all months)
+-- ============================================================
+-- Point-in-time rule: account was enrolled in month M if
+--   created_at <= last_day(M)                  -- instruction existed
+--   AND (status = 'active'                     -- still active today
+--        OR updated_at > last_day(M))           -- cancelled after month M ended
+--
+-- Autopay launched Oct 2024; data starts there.
+-- No business ever has >1 active instruction simultaneously.
+-- ============================================================
+with month_spine as (
+    select
+         to_char(dateadd(month, seq4(), '2024-10-01'::date), 'YYYY-MM')         as report_mth
+        ,last_day(dateadd(month, seq4(), '2024-10-01'::date))                    as month_end
+    from table(generator(rowcount => 36))
+    where dateadd(month, seq4(), '2024-10-01'::date) < date_trunc('month', current_date)
+),
+autopay as (
+    select *
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_AUTOPAY_INSTRUCTIONS
+    where business_id not in (
+        select business_id
+        from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+        where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+    )
+)
+select
+     m.report_mth
+    ,count(distinct ap.business_id)                                               as enrolled_total
+    ,count(distinct case when ap.type = 'statement_balance' then ap.business_id end) as enrolled_pay_in_full
+    ,count(distinct case when ap.type = 'minimum_due'       then ap.business_id end) as enrolled_minimum_due
+    ,count(distinct case when ap.type = 'fixed_amount'      then ap.business_id end) as enrolled_fixed_amount
+from month_spine m
+left join autopay ap
+    on  ap.created_at::date <= m.month_end
+    and (ap.status = 'active' or ap.updated_at::date > m.month_end)
+group by 1
+order by 1
+;
+
+
+-- ============================================================
+-- Application IDs: Apr 2026 – May 27 2026
+-- ============================================================
+select
+     a.id                                                                         as application_id
+    ,a.business_id
+    ,a.status
+    ,to_char(a.created_at, 'YYYY-MM-DD')                                          as applied_at
+    ,d.decision
+    ,to_char(d.created_at, 'YYYY-MM-DD')                                          as decision_at
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
+left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS d
+    on d.application_id = a.id
+where a.created_at >= '2026-04-01'
+  and a.created_at <  '2026-05-28'
+  and a.business_id not in (
+      select business_id
+      from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+      where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+  )
+order by a.created_at
+;
+
+
+-- ============================================================
+-- Cure Rate: Apr 2026 delinquents that became current in May 2026
+-- ============================================================
+-- Delinquent in Apr = DPD between 1 and 179 at last_day(Apr 2026)
+-- Cured in May     = same account at DPD = 0 at last_day(May 2026)
+-- Charged off      = DPD >= 180 at last_day(May 2026) — not a cure
+-- ============================================================
+with loan_tape_updated as (
+    select
+         a.*
+        ,b.business_id
+        ,row_number() over (partition by b.business_id, a.statement_date order by a.record_version desc) as rn
+    from PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY a
+    left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS b
+        on a.account_id = b.external_account_id
+    where b.business_id not in (
+        select business_id
+        from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+        where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+    )
+    and a.billing_period_number >= 1
+),
+apr_delinquent as (
+    select
+         business_id
+        ,days_past_due as apr_dpd
+    from (select * from loan_tape_updated where rn = 1)
+    where statement_date = last_day('2026-04-01'::date)
+      and days_past_due between 1 and 179
+),
+may_status as (
+    select
+         business_id
+        ,days_past_due as may_dpd
+    from (select * from loan_tape_updated where rn = 1)
+    where statement_date = last_day('2026-05-01'::date)
+)
+select
+     count(distinct a.business_id)                                                as apr_delinquent_accts
+    ,count(distinct case when m.may_dpd = 0          then a.business_id end)      as cured_to_current
+    ,count(distinct case when m.may_dpd between 1 and 179 then a.business_id end) as still_delinquent
+    ,count(distinct case when m.may_dpd >= 180        then a.business_id end)      as rolled_to_chargeoff
+    ,count(distinct case when m.business_id is null   then a.business_id end)      as closed_or_missing
+    ,round(
+        count(distinct case when m.may_dpd = 0 then a.business_id end)
+        / nullifzero(count(distinct a.business_id))
+    , 4)                                                                           as cure_rate
+from apr_delinquent a
+left join may_status m on a.business_id = m.business_id
+;
