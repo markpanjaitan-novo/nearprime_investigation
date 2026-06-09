@@ -1,4 +1,7 @@
 # nearprime_investigation — Claude Context
+## AGENT INSTRUCTIONS
+
+You are an expert of credit card product and business analysis.
 
 ## Snowflake connection
 
@@ -83,6 +86,8 @@ CREDIT_CARD_APPLICATIONS
         → CREDIT_CARD_AUTOPAY_INSTRUCTIONS           (credit_card_account_id / business_id)
         → CREDIT_CARD_NOVO_SETTLEMENT_REPORT_ITEMS   (credit_card_account_id = accounts.id)
         → CREDIT_CARD_TRANSACTION_REWARD_ITEMS       (credit_card_account_id = accounts.id)
+        → CREDIT_CARD_REWARD_REDEMPTIONS             (credit_card_account_id = accounts.id)
+        → CREDIT_CARD_ACCOUNT_REWARDS                (credit_card_account_id = accounts.id)
         → CREDIT_CARD_TRANSACTION_DISPUTES           (business_id)
 
 CREDIT_CARD_INVITATIONS  (business_id) — FICO score source (pre-approval, not refreshed)
@@ -135,7 +140,17 @@ PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campa
 
 - `start_date` / `end_date` = billing window; `payment_due_date` = payment deadline
 - `statement_balance`, `minimum_payment_due` in cents
-- `earned_cashback`, `redeemed_cashback` in cents
+- Cashback columns (all cents):
+
+| Column | Notes |
+|---|---|
+| `earned_cashback` | Cashback earned this statement cycle |
+| `redeemed_cashback` | Cashback redeemed (withdrawn) this statement cycle |
+| `available_cashback` | Balance available to redeem at statement close |
+| `total_earned_cashback` | Lifetime earned cumulative |
+| `total_redeemed_cashback` | Lifetime redeemed cumulative |
+
+As of Jun 2026: 2,887 statements have `redeemed_cashback > 0`; $276K total redeemed at statement level. For event-level redemption detail use `CREDIT_CARD_REWARD_REDEMPTIONS` instead.
 
 ### `CREDIT_CARD_PAYMENTS`
 
@@ -176,7 +191,63 @@ PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campa
 ### `CREDIT_CARD_TRANSACTION_REWARD_ITEMS`
 
 - `rewards` — cashback accrued per transaction, **negative cents**. Use `* -1 / 100`
+- `is_available` — `TRUE` = reward is still available to redeem; `FALSE` = reward has been consumed by a redemption
+  - 439K rows `is_available = TRUE` (~$577K accrued); 25K rows `is_available = FALSE` (~$35K consumed)
 - Join: `credit_card_account_id = CREDIT_CARD_ACCOUNTS.id`
+- This table tracks **accrual** (earn events). For **redemption** events use `CREDIT_CARD_REWARD_REDEMPTIONS`.
+
+### `CREDIT_CARD_REWARD_REDEMPTIONS`
+
+**Use this table to track when customers actually redeem (spend) their cashback.**
+
+- One row per redemption event — cash is deposited into the customer's DDA account
+- 3,116 rows, all `status = 'success'`; $308,504 total redeemed to date (Jun 2026)
+- Join: `credit_card_account_id = CREDIT_CARD_ACCOUNTS.id`
+
+| Column | Notes |
+|---|---|
+| `credit_card_account_id` | Join to `CREDIT_CARD_ACCOUNTS.id` |
+| `rewards` | Amount redeemed in **cents** (÷100 for dollars) |
+| `status` | Only `'success'` observed — no pending/failed rows |
+| `posted_at` | Timestamp cash settled to DDA — use this for monthly grouping |
+| `created_at` | Timestamp redemption was initiated |
+| `transaction_id` | Links to the DDA `TRANSACTIONS` table (the cash deposited) |
+| `user_id` | User who triggered the redemption |
+| `trace_number` | ACH trace ID (format: `NCCRxxxxxxxxxx`) |
+
+**Monthly redemption query:**
+```sql
+select
+     to_char(r.posted_at, 'YYYY-MM')             as redeem_month
+    ,count(distinct r.credit_card_account_id)     as accounts_redeemed
+    ,count(*)                                      as redemption_events
+    ,round(sum(r.rewards) / 100.0, 2)             as total_redeemed_dollars
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_REWARD_REDEMPTIONS r
+join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS a
+    on a.id = r.credit_card_account_id
+where coalesce(a._fivetran_deleted, false) = false
+  and r.status = 'success'
+  and a.business_id not in (
+      select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+      where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+  )
+group by 1
+order by 1
+```
+
+### `CREDIT_CARD_ACCOUNT_REWARDS`
+
+- Current-state reward balance per account (one row per account, not historical)
+- Join: `credit_card_account_id = CREDIT_CARD_ACCOUNTS.id`
+- All amounts in cents
+
+| Column | Notes |
+|---|---|
+| `pending_rewards` | Earned but not yet settled |
+| `available_rewards` | Available to redeem now |
+| `redeemed_rewards` | Lifetime redeemed total |
+
+Use this for a point-in-time snapshot of unspent reward balances across the portfolio. For event history use `CREDIT_CARD_REWARD_REDEMPTIONS`.
 
 ### `CREDIT_CARD_TRANSACTION_DISPUTES`
 
@@ -237,6 +308,28 @@ PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campa
 - Delinquent = `days_past_due BETWEEN 1 AND 179` at month-end
 - Cured = same account at `days_past_due = 0` the following month-end
 - Rolled to CO = `days_past_due >= 180` the following month — not a cure
+
+### Revenue vs. NIBT — two distinct metrics
+
+**Revenue per account** (used in `may_2026_cc_metrics.sql`):
+```
+Revenue = Interchange + Interest collected + Fees collected
+```
+Rewards are **not** revenue — they are a cost paid to the customer and must not be included here.
+
+- Interchange: `sum(interchange_gross_amount * -1 / 100.0)` from `CREDIT_CARD_NOVO_SETTLEMENT_REPORT_ITEMS`
+- Interest collected: `payment_allocated_interest / 100.0` from loan tape at month-end statement
+- Fees collected: `payment_allocated_fees / 100.0` from loan tape at month-end statement
+
+**NIBT** (used in `30_vintage_driver.sql` — cumulative per vintage cohort):
+```
+NIBT = Interchange + Interest collected + Fees collected − Rewards accrued − Chargeoffs − Purchase fraud
+```
+Rewards here are accrual-based (cashback earned on transactions), sourced from `CREDIT_CARD_TRANSACTION_REWARD_ITEMS.rewards` (negative cents). The vintage driver CTE is named `reward_redemption` but queries the **accrual** table, not `CREDIT_CARD_REWARD_REDEMPTIONS`.
+
+Do not confuse the two rewards tables:
+- `CREDIT_CARD_TRANSACTION_REWARD_ITEMS` — cashback **earned** per transaction (accrual). Used in NIBT cost calculation.
+- `CREDIT_CARD_REWARD_REDEMPTIONS` — cashback **paid out** to the customer's DDA (cash event). Used for redemption tracking only.
 
 ## DDA (checking account) tables
 

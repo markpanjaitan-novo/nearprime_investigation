@@ -348,3 +348,246 @@ select
 from apr_delinquent a
 left join may_status m on a.business_id = m.business_id
 ;
+
+
+-- ============================================================
+-- Monthly rewards: accrued, redeemed, standing balance EOM
+-- ============================================================
+-- Accrual  : CREDIT_CARD_TRANSACTION_REWARD_ITEMS.created_at
+-- Redeemed : CREDIT_CARD_REWARD_REDEMPTIONS.posted_at
+-- Balance  : running sum(accrued - redeemed) — portfolio-level
+-- All amounts in dollars
+-- ============================================================
+with ff_excl as (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+),
+
+monthly_accrual as (
+    select
+         to_char(ri.created_at, 'YYYY-MM')          as report_mth
+        ,round(sum(ri.rewards * -1) / 100.0, 2)     as accrued_dollars
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_TRANSACTION_REWARD_ITEMS ri
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS a
+        on a.id = ri.credit_card_account_id
+    where coalesce(a._fivetran_deleted, false) = false
+      and a.business_id not in (select business_id from ff_excl)
+    group by 1
+),
+
+monthly_redeemed as (
+    select
+         to_char(r.posted_at, 'YYYY-MM')             as report_mth
+        ,round(sum(r.rewards) / 100.0, 2)            as redeemed_dollars
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_REWARD_REDEMPTIONS r
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS a
+        on a.id = r.credit_card_account_id
+    where r.status = 'success'
+      and coalesce(a._fivetran_deleted, false) = false
+      and a.business_id not in (select business_id from ff_excl)
+    group by 1
+),
+
+combined as (
+    select
+         coalesce(ac.report_mth, rd.report_mth)      as report_mth
+        ,coalesce(ac.accrued_dollars, 0)              as accrued_dollars
+        ,coalesce(rd.redeemed_dollars, 0)             as redeemed_dollars
+    from monthly_accrual ac
+    full outer join monthly_redeemed rd
+        on rd.report_mth = ac.report_mth
+)
+
+select
+     report_mth
+    ,accrued_dollars
+    ,redeemed_dollars
+    ,round(
+        sum(accrued_dollars - redeemed_dollars)
+            over (order by report_mth rows between unbounded preceding and current row)
+        , 2)                                          as balance_eom
+from combined
+order by report_mth
+;
+
+
+-- ============================================================
+-- Autopay enrollment vs not — active accounts at end of May 2026
+-- ============================================================
+-- "Active" = had a May 31 month-end statement with DPD < 180
+-- (excludes charged-off and closed accounts)
+-- Autopay point-in-time: enrolled if instruction existed by May 31
+-- and was still active OR cancelled after May 31
+-- ============================================================
+with ff_excl as (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+),
+
+active_may as (
+    select h.account_id, a.business_id
+    from PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY h
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS a
+        on a.external_account_id = h.account_id
+    where h.statement_date = '2026-05-31'
+      and h.days_past_due < 180
+      and h.billing_period_number >= 1
+      and a.business_id not in (select business_id from ff_excl)
+    qualify row_number() over (partition by h.account_id order by h.record_version desc) = 1
+),
+
+autopay_may as (
+    select distinct business_id, type
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_AUTOPAY_INSTRUCTIONS
+    where created_at::date <= '2026-05-31'
+      and (status = 'active' or updated_at::date > '2026-05-31')
+      and business_id not in (select business_id from ff_excl)
+)
+
+select
+     count(distinct am.business_id)                                                     as total_active_accounts
+    ,count(distinct ap.business_id)                                                     as enrolled_in_autopay
+    ,count(distinct case when ap.business_id is null then am.business_id end)           as not_enrolled
+    ,round(count(distinct ap.business_id)
+        / nullifzero(count(distinct am.business_id)), 4)                                as enrollment_rate
+    ,count(distinct case when ap.type = 'statement_balance' then am.business_id end)   as autopay_pay_in_full
+    ,count(distinct case when ap.type = 'minimum_due'       then am.business_id end)   as autopay_minimum_due
+    ,count(distinct case when ap.type = 'fixed_amount'      then am.business_id end)   as autopay_fixed_amount
+from active_may am
+left join autopay_may ap on ap.business_id = am.business_id
+;
+
+
+-- ============================================================
+-- Apr 2026 invite-to-booking conversion (booked before May 27)
+-- ============================================================
+with ff_excl as (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+),
+
+apr_invites as (
+    select distinct business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_INVITATIONS
+    where created_at >= '2026-04-01'
+      and created_at <  '2026-05-01'
+      and business_id not in (select business_id from ff_excl)
+),
+
+bookings as (
+    select a.business_id, min(d.created_at)::date as booked_date
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS d
+        on d.application_id = a.id
+       and d.decision = 'APPROVED'
+    where d.created_at < '2026-05-27'
+      and a.business_id not in (select business_id from ff_excl)
+    group by 1
+)
+
+select
+     count(distinct i.business_id)                                              as apr_invites_sent
+    ,count(distinct b.business_id)                                              as booked_by_may27
+    ,count(distinct case when b.business_id is null then i.business_id end)     as did_not_book
+    ,round(count(distinct b.business_id)
+        / nullifzero(count(distinct i.business_id)), 4)                         as conversion_rate
+from apr_invites i
+left join bookings b on b.business_id = i.business_id
+;
+
+
+-- ============================================================
+-- Applications closed/canceled in May 2026
+-- ============================================================
+-- There is no explicit 'EXPIRED' status in CREDIT_CARD_APPLICATIONS.
+-- CLOSED   = application lapsed with no decision ever made — closest
+--            match to "expired" (no row in APPLICATION_DECISIONS)
+-- CANCELED = application was actively canceled (likely customer-initiated)
+-- Updated_at is used as the date the status changed to CLOSED/CANCELED.
+-- ============================================================
+select
+     to_char(a.updated_at, 'YYYY-MM-DD')                         as closed_date
+    ,a.status
+    ,count(*)                                                     as application_count
+    ,count(distinct a.business_id)                               as distinct_businesses
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
+where a.status in ('CLOSED', 'CANCELED')
+  and to_char(a.updated_at, 'YYYY-MM') = '2026-05'
+  and a.business_id not in (
+      select business_id
+      from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+      where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+  )
+group by 1, 2
+order by 1, 2
+;
+
+
+-- ============================================================
+-- Average revenue per account — May 2026
+-- ============================================================
+-- Revenue = interchange + interest collected + fees collected
+-- Active accounts: DPD < 180 at May 31
+-- ============================================================
+with ff_excl as (
+    select business_id
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
+    where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'
+),
+
+active_may as (
+    select
+         h.account_id
+        ,a.business_id
+        ,a.id                                                   as cc_account_id
+        ,round(h.payment_allocated_interest / 100.0, 2)        as interest_collected
+        ,round(h.payment_allocated_fees     / 100.0, 2)        as fees_collected
+    from PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY h
+    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS a
+        on a.external_account_id = h.account_id
+    where h.statement_date = '2026-05-31'
+      and h.days_past_due < 180
+      and h.billing_period_number >= 1
+      and a.business_id not in (select business_id from ff_excl)
+    qualify row_number() over (partition by h.account_id order by h.record_version desc) = 1
+),
+
+interchange as (
+    select
+         a.business_id
+        ,round(sum(s.interchange_gross_amount * -1 / 100.0), 2) as interchange_dollars
+    from active_may a
+    left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_NOVO_SETTLEMENT_REPORT_ITEMS s
+        on  s.credit_card_account_id = a.cc_account_id
+        and to_char(s.created_at, 'YYYY-MM') = '2026-05'
+    group by 1
+),
+
+per_account as (
+    select
+         a.business_id
+        ,coalesce(i.interchange_dollars, 0)                     as interchange
+        ,a.interest_collected
+        ,a.fees_collected
+        ,coalesce(i.interchange_dollars, 0)
+            + a.interest_collected
+            + a.fees_collected                                   as total_revenue
+    from active_may a
+    left join interchange i on i.business_id = a.business_id
+)
+
+select
+     count(*)                                                    as active_accounts
+    ,round(sum(interchange),         2)                         as total_interchange
+    ,round(sum(interest_collected),  2)                         as total_interest_collected
+    ,round(sum(fees_collected),      2)                         as total_fees_collected
+    ,round(sum(total_revenue),       2)                         as total_revenue
+    ,round(avg(interchange),         2)                         as avg_interchange_per_acct
+    ,round(avg(interest_collected),  2)                         as avg_interest_per_acct
+    ,round(avg(fees_collected),      2)                         as avg_fees_per_acct
+    ,round(avg(total_revenue),       2)                         as avg_revenue_per_acct
+from per_account
+;
