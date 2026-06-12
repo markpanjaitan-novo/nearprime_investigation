@@ -282,11 +282,8 @@ select
     ,a.business_id
     ,a.status
     ,to_char(a.created_at, 'YYYY-MM-DD')                                          as applied_at
-    ,d.decision
-    ,to_char(d.created_at, 'YYYY-MM-DD')                                          as decision_at
+    ,case when a.status = 'APPROVED' then to_char(a.created_at, 'YYYY-MM-DD') end as booking_date
 from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
-left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS d
-    on d.application_id = a.id
 where a.created_at >= '2026-04-01'
   and a.created_at <  '2026-05-28'
   and a.business_id not in (
@@ -478,13 +475,11 @@ apr_invites as (
 ),
 
 bookings as (
-    select a.business_id, min(d.created_at)::date as booked_date
-    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
-    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS d
-        on d.application_id = a.id
-       and d.decision = 'APPROVED'
-    where d.created_at < '2026-05-27'
-      and a.business_id not in (select business_id from ff_excl)
+    select business_id, min(created_at)::date as booked_date
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS
+    where status = 'APPROVED'
+      and created_at < '2026-05-27'
+      and business_id not in (select business_id from ff_excl)
     group by 1
 )
 

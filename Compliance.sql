@@ -6,11 +6,8 @@ select
     ,a.business_id
     ,a.status
     ,to_char(a.created_at, 'YYYY-MM-DD')                                          as applied_at
-    ,d.decision
-    ,to_char(d.created_at, 'YYYY-MM-DD')                                          as decision_at
+    ,case when a.status = 'APPROVED' then to_char(a.created_at, 'YYYY-MM-DD') end as booking_date
 from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
-left join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS d
-    on d.application_id = a.id
 where a.created_at >= '2026-04-01'
   and a.created_at <  '2026-05-28'
   and a.business_id not in (

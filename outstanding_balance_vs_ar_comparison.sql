@@ -30,7 +30,7 @@ WITH report_date AS (
     SELECT
          a.*
         ,b.business_id
-        ,d.created_at                                                        AS approval_timestamp
+        ,b.created_at                                                        AS approval_timestamp
         ,ROW_NUMBER() OVER (
              PARTITION BY b.business_id, a.statement_date
              ORDER BY a.record_version DESC
@@ -38,11 +38,6 @@ WITH report_date AS (
     FROM PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY a
     LEFT JOIN FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS b
         ON a.account_id = b.external_account_id
-    LEFT JOIN fivetran_db.prod_novo_api_public.credit_card_applications c
-        ON b.business_id = c.business_id
-        AND c.status = 'APPROVED'
-    LEFT JOIN fivetran_db.prod_novo_api_public.credit_card_application_decisions d
-        ON c.id = d.application_id
     WHERE b.business_id NOT IN (
         SELECT business_id FROM FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS
         WHERE business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e'

@@ -29,9 +29,14 @@ and a.billing_period_number >= 1
 ),
 booking_date as (
 select
- business_id
-,min(statement_date) as created_at
-from (select * from loan_tape_updated where rn = 1)
+     ca.business_id
+    ,min(app.created_at) as created_at
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS ca
+join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS app
+    on  app.business_id = ca.business_id
+    and app.status = 'APPROVED'
+where coalesce(ca._fivetran_deleted, false) = false
+  and ca.business_id not in (select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e')
 group by 1
 ),
 loan_tape_statement_join as (
@@ -119,9 +124,14 @@ and a.billing_period_number >= 1
 ),
 booking_date as (
 select
- business_id
-,min(statement_date) as created_at
-from (select * from loan_tape_updated where rn = 1)
+     ca.business_id
+    ,min(app.created_at) as created_at
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS ca
+join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS app
+    on  app.business_id = ca.business_id
+    and app.status = 'APPROVED'
+where coalesce(ca._fivetran_deleted, false) = false
+  and ca.business_id not in (select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e')
 group by 1
 ),
 loan_tape_statement_join as (
@@ -210,10 +220,17 @@ and a.billing_period_number >= 1
 ),
 booking_date as (
 select
- business_id
-,fico_score
-,min(statement_date) as created_at
-from (select * from loan_tape_updated where rn = 1)
+     ca.business_id
+    ,inv.fico_score
+    ,min(app.created_at) as created_at
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS ca
+join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS app
+    on  app.business_id = ca.business_id
+    and app.status = 'APPROVED'
+left join (select * from most_recent_invite where rn = 1) inv
+    on inv.business_id = ca.business_id
+where coalesce(ca._fivetran_deleted, false) = false
+  and ca.business_id not in (select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e')
 group by 1,2
 ),
 loan_tape_statement_join as (
@@ -406,9 +423,14 @@ and a.billing_period_number >= 1
 ),
 booking_date as (
 select
- business_id
-,min(statement_date) as created_at
-from (select * from loan_tape_updated where rn = 1)
+     ca.business_id
+    ,min(app.created_at) as created_at
+from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS ca
+join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS app
+    on  app.business_id = ca.business_id
+    and app.status = 'APPROVED'
+where coalesce(ca._fivetran_deleted, false) = false
+  and ca.business_id not in (select business_id from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.BUSINESS_GROUP_ASSIGNMENTS where business_group_id = '75fe98d2-6549-46a1-aa04-a1c621e21d9e')
 group by 1
 ),
 loan_tape_statement_join as (

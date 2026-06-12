@@ -3,6 +3,18 @@
 
 You are an expert of credit card product and business analysis.
 
+## CRITICAL: Banned table
+
+**NEVER use `FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS`.**
+This table has multi-row fan-out per application and must not appear in any query, CTE, or join.
+
+Canonical replacements:
+- **Booking date / booking timestamp** → `CREDIT_CARD_ACCOUNTS.created_at` (account creation ≈ approval date; this table only contains approved/opened accounts)
+- **Approval filter** → `CREDIT_CARD_APPLICATIONS.status = 'APPROVED'` instead of `decisions.decision = 'APPROVED'`
+- **`_fivetran_deleted` guard** when joining CREDIT_CARD_ACCOUNTS → always add `coalesce(_fivetran_deleted, false) = false`
+
+There is no replacement for `decision_notes` (manual review classification). Any query relying on that column must be commented out with an explanation until an alternative source is identified.
+
 ## Snowflake connection
 
 This project queries Snowflake directly from the terminal using the Python connector.
@@ -91,6 +103,7 @@ CREDIT_CARD_APPLICATIONS
         → CREDIT_CARD_TRANSACTION_DISPUTES           (business_id)
 
 CREDIT_CARD_INVITATIONS  (business_id) — FICO score source (pre-approval, not refreshed)
+CREDIT_CARDS             (business_id) — physical/virtual card records; activation status
 BUSINESS_GROUP_ASSIGNMENTS (business_id) — F&F / internal test account exclusion list
 PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campaign tagging
 ```
@@ -99,14 +112,29 @@ PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campa
 
 ### `PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY` — the core risk table
 
-- **Grain:** `(account_id, statement_date, record_version)`. Always dedupe:
-  ```sql
-  row_number() over (partition by business_id, statement_date order by record_version desc) = 1
-  ```
-- ~8,210 distinct accounts; data from Oct 2024 → present
+- **Grain: DAILY APPEND table** — one row per calendar day per billing period per account. The table is not a period-end snapshot; it appends a new row every day as that day's state is finalized. ~8,210 distinct accounts; data from Oct 2024 → present
 - **All money columns are in cents — divide by 100 everywhere**
 - `billing_period_number = 0` is the booking-month statement (often excluded with `>= 1`)
-- Filter to month-end snapshots: `statement_date in (select last_day(statement_date) from ...)`
+- **Getting the period-end snapshot** (for ADB, ending balance, etc.): select the last row of the period using `ORDER BY statement_date DESC, record_version DESC` within `PARTITION BY billing_period_number`:
+  ```sql
+  qualify row_number() over (
+      partition by ca.business_id, lt.billing_period_number
+      order by lt.statement_date desc, lt.record_version desc
+  ) = 1
+  ```
+  **WARNING: `ORDER BY record_version DESC` alone is wrong.** `record_version` marks amendments to a specific day — a mid-period day can receive a `record_version=2` amendment, making it the highest record_version in the partition even though it is not the last day of the period. This causes ADB to be read from mid-period (grossly understated — verified 12× understatement on one account). Always sort by `statement_date DESC` first.
+- **Production alternative pattern** (used in `28_cc_card_adoption_active_balance.sql`, `30_vintage_driver.sql`): deduplicate per day first (`PARTITION BY (business_id, statement_date) ORDER BY record_version DESC`), then filter to period-end using `day(statement_date) = 1` or a `last_day()` subquery. Both approaches are equivalent; the single-step pattern above is simpler for per-period analysis.
+- Two patterns for month-end snapshot filtering — both are used in different query types:
+  - **Calendar-month queries** (DPD buckets, roll rate): `day(statement_date) = 1` selects the 1st of the next month; pair with `to_char(statement_date-1, 'YYYY-MM')` to label the correct report month
+  - **Booking-vintage queries**: `statement_date in (select distinct last_day(statement_date) from ...)` selects the last day of each billing month; pair with `to_char(statement_date, 'YYYY-MM')`
+  - These select **different calendar dates** — do not mix the two patterns in a single query
+- **`business_id` is NOT a column on this table.** To get `business_id`, always join to `CREDIT_CARD_ACCOUNTS`:
+  ```sql
+  from PROD_DB.DATA.CREDIT_CARD_ACCOUNT_LOAN_TAPE_HISTORY lt
+  join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS ca
+      on ca.external_account_id = lt.account_id
+  ```
+  Then use `ca.business_id` everywhere. Referencing `lt.business_id` will throw `invalid identifier`.
 
 | Column | Notes |
 |---|---|
@@ -117,10 +145,12 @@ PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campa
 | `next_due_principal + past_statements_principal + due_principal + past_due_principal` | **4-slice principal sum** — total principal owed; used for chargeoff $ |
 | `payment_allocated_principal / interest / fees` | Payments received that period by component (cents) |
 | `effective_apr_purchases` | Purchase APR in effect |
-| `grace_period` | Boolean — TRUE means paid in full last cycle, no interest accruing |
-| `record_version` | Higher = more recent; used in dedup ROW_NUMBER |
+| `grace_period` | Boolean — TRUE means paid in full last cycle, no interest accruing. Compare as `= false` (not the string `'false'`) |
+| `record_version` | Amendment counter scoped to a specific `(account_id, statement_date)` — NOT a period-level version. Higher = more recent amendment for that specific day. Mid-period days can receive amendments (record_version=2+); last day of period almost always stays at record_version=1. |
 | `starting_balance` / `ending_balance` | Period open/close balances |
-| `daily_balance_purchases` | ADB for purchase balance |
+| `daily_balance_purchases` | **Running cumulative ADB for purchase balance** — on day N of the billing period it equals `sum(ending_balance[days 1..N]) / N`. Only the last day's row contains the final ADB for that period. **Stored as TEXT** in Snowflake; cast explicitly: `daily_balance_purchases::number / 100`. Reading this column from a mid-period row gives an incorrect (understated) ADB. |
+| `day_purchases` | Purchase amount transacted on that specific day (NUMBER, cents). Distinct from `daily_balance_purchases`. Used for purchase volume in vintage analysis |
+| `period_payments` | Total payments received during the billing period (NUMBER, cents, negative sign). Used in min-pay ratio vintage queries |
 
 ### `CREDIT_CARD_ACCOUNTS`
 
@@ -139,7 +169,8 @@ PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP (business_id) — risk bucket and campa
 ### `CREDIT_CARD_STATEMENTS`
 
 - `start_date` / `end_date` = billing window; `payment_due_date` = payment deadline
-- `statement_balance`, `minimum_payment_due` in cents
+- `statement_balance`, `minimum_payment_due`, `purchases` in cents
+- `purchases` — total purchase volume billed in this statement cycle (NUMBER, cents)
 - Cashback columns (all cents):
 
 | Column | Notes |
@@ -190,7 +221,7 @@ As of Jun 2026: 2,887 statements have `redeemed_cashback > 0`; $276K total redee
 
 ### `CREDIT_CARD_TRANSACTION_REWARD_ITEMS`
 
-- `rewards` — cashback accrued per transaction, **negative cents**. Use `* -1 / 100`
+- `rewards` — cashback accrued per transaction, **positive cents**. Use `/ 100`
 - `is_available` — `TRUE` = reward is still available to redeem; `FALSE` = reward has been consumed by a redemption
   - 439K rows `is_available = TRUE` (~$577K accrued); 25K rows `is_available = FALSE` (~$35K consumed)
 - Join: `credit_card_account_id = CREDIT_CARD_ACCOUNTS.id`
@@ -261,6 +292,14 @@ Use this for a point-in-time snapshot of unspent reward balances across the port
 - Pre-approval score only — not refreshed post-booking
 - Always take the most recent: `row_number() over (partition by business_id order by created_at desc) = 1`
 
+### `CREDIT_CARDS`
+
+- One row per card issued (physical or virtual) per account; a business can have multiple rows
+- Join: `business_id` to `CREDIT_CARD_ACCOUNTS.business_id`
+- Dedup to latest physical card: `type = 'physical'` + `row_number() over (partition by business_id order by created_at desc) = 1`
+- `is_activated` (BOOLEAN) — TRUE once the cardholder has activated the physical card
+- Used for activation-rate reporting by booking vintage and FICO band
+
 ### `PROD_DB.ADHOC.MONITOR_RISK_BUCKET_LOOKUP`
 
 - Maps `business_id` → `risk_bucket` and `campaign` for vintage segmentation
@@ -276,14 +315,19 @@ Use this for a point-in-time snapshot of unspent reward balances across the port
 | 0 | Current |
 | 1–29 | Bucket 1 |
 | 30–59 | Bucket 2 |
-| 60–179 | Bucket 3+ / pre-CO delinquent |
-| 180–210 | Chargeoff transition |
+| 60–89 | Bucket 3 |
+| 90–119 | Bucket 4 |
+| 120–149 | Bucket 5 |
+| 150–179 | Bucket 6 |
+| 180–210 | Bucket 7 / Chargeoff transition |
 | >210 | Post-CO / out of scope |
 
 ### Chargeoff recognition
 
 - Triggered when `days_past_due BETWEEN 180 AND 210` at month-end statement
-- Dollar amount = 4-slice principal sum: `(next_due_principal + past_statements_principal + due_principal + past_due_principal) / 100`
+- **CO dollar amount depends on context — two definitions are used:**
+  - **NACO rate / CO vintage queries** (`cum co unit`, `cum co dollar`, `co unit non-cum`): use `ending_balance / 100` — the full balance written off the books, including accrued interest and fees. This is the regulatory/accounting standard and is consistent with the `ending_balance` denominator used in the NACO rate.
+  - **NIBT CO component** (`cum nibt`, `nibt non-cum`, monthly `nibt`): use the 4-slice principal sum `(next_due_principal + past_statements_principal + due_principal + past_due_principal) / 100` — avoids double-counting because accrued interest/fees were never recognised as revenue in NIBT.
 - Take first crossing only to avoid double-counting:
   ```sql
   qualify row_number() over (partition by account_id order by statement_date asc) = 1

@@ -359,12 +359,9 @@ with inv as (
     qualify row_number() over (partition by business_id order by created_at desc) = 1
 ),
 booking as (
-    select b.business_id, min(d.created_at)::date as booking_date
-    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS a
-    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATION_DECISIONS d
-        on d.application_id = a.id and d.decision = 'APPROVED'
-    join FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_ACCOUNTS b
-        on b.business_id = a.business_id
+    select business_id, min(created_at)::date as booking_date
+    from FIVETRAN_DB.PROD_NOVO_API_PUBLIC.CREDIT_CARD_APPLICATIONS
+    where status = 'APPROVED'
     group by 1
 ),
 active_may as (
